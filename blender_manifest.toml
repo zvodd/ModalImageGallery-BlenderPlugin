@@ -6,6 +6,6 @@ tagline = "Adds an overlay to display and select images in the Image Editor"
 type = "add-on"
 schema_version = "1.0.0"
 blender_version_min = "5.0.0"
-version = "1.0.0"
+version = "1.0.2"
 tags = ["Image"]
 license = ["SPDX:GPL-3.0-or-later"]
