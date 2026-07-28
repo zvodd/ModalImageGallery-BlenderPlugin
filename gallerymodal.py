@@ -10,7 +10,6 @@ class ImageGalleryOverlay(bpy.types.Operator):
 
     _draw_handler = None
     edarea = None
-    grid_data = None
     columns = 0
     spacing = 10.0
 
@@ -18,6 +17,9 @@ class ImageGalleryOverlay(bpy.types.Operator):
     _cell_size = 200.0
     _scroll_y = 0.0
     _initialized = False
+
+    # Singular Instance Lock
+    _instance = None
 
     @property
     def cell_size(self): return ImageGalleryOverlay._cell_size
@@ -29,36 +31,51 @@ class ImageGalleryOverlay(bpy.types.Operator):
     @scroll_y.setter
     def scroll_y(self, val): ImageGalleryOverlay._scroll_y = val
 
+    @classmethod
+    def is_running(cls):
+        # Clean up stale instance state if Blender cleared it manually
+        if cls._instance is not None:
+            if not hasattr(cls._instance, 'modal'):
+                cls._instance = None
+                return False
+        return cls._instance is not None
+
     def clean_up(self):
         if self._draw_handler is not None:
             bpy.types.SpaceImageEditor.draw_handler_remove(self._draw_handler, 'WINDOW')
         self._draw_handler = None
         self.edarea = None
-        self.grid_data = None
+        ImageGalleryOverlay._instance = None
 
     def get_relative_mouse_coords(self, context, event):
-        """
-        Safely converts window-relative mouse coordinates to region-relative ones.
-        Fallbacks to manual subtractions if region/view2d APIs fail.
-        """
         mx, my = event.mouse_x, event.mouse_y
-        
         for region in context.area.regions:
             if region.type == 'WINDOW':
                 mx -= region.x
                 my -= region.y
                 return mx, my
-                
-        # Safe fallback if region iteration fails for any reason
         mx -= context.area.x
         my -= context.area.y
         return mx, my
 
     def modal(self, context, event):
+        # If the edarea is destroyed or we lost lock somehow, kill it
+        if self.edarea is None or not self.edarea.as_pointer():
+            self.clean_up()
+            return {'CANCELLED'}
+
         if context.area != self.edarea:
             return {'PASS_THROUGH'}
 
         context.area.tag_redraw()
+
+        # Explicitly check region dimensions for viewport resizes
+        if hasattr(self, '_last_width') and hasattr(self, '_last_height'):
+            if self._last_width != context.region.width or self._last_height != context.region.height:
+                ImageGalleryOverlay._initialized = False  # Recenter on resize
+                self.grid_data = self.calculate_grid(context)
+        self._last_width = context.region.width
+        self._last_height = context.region.height
 
         if event.type in {'RIGHTMOUSE', 'ESC'}:
             self.clean_up()
@@ -68,13 +85,12 @@ class ImageGalleryOverlay(bpy.types.Operator):
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.ctrl:
             delta = 20.0 if event.type == 'WHEELUPMOUSE' else -20.0
             self.cell_size = max(50.0, min(self.cell_size + delta, 500.0))
-            ImageGalleryOverlay._initialized = False # Reset to recenter on current view after zoom
+            ImageGalleryOverlay._initialized = False 
             self.grid_data = self.calculate_grid(context)
             return {'RUNNING_MODAL'}
 
         # Wheel only to scroll
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and not event.ctrl:
-            # Scale scroll speed with viewport height so it feels natural on 4K and 1080p
             scroll_speed = context.region.height * 0.1
             delta = scroll_speed if event.type == 'WHEELUPMOUSE' else -scroll_speed
             self.scroll_y += delta
@@ -94,13 +110,26 @@ class ImageGalleryOverlay(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
     def invoke(self, context, event):
+        # Enforce strictly singular instance
+        if ImageGalleryOverlay.is_running():
+            self.report({'WARNING'}, "Gallery overlay is already running")
+            return {'CANCELLED'}
+
         if context.area.type == 'IMAGE_EDITOR':
+            ImageGalleryOverlay._instance = self
             self.edarea = context.area
+            self._last_width = context.region.width
+            self._last_height = context.region.height
             self.grid_data = self.calculate_grid(context)
             
-            # Using a tuple of the primitives to avoid persistent binding errors on unregister
-            args = (self.cell_size, self.spacing, self.grid_data)
-            self._draw_handler = bpy.types.SpaceImageEditor.draw_handler_add(self.draw_callback_px, args, 'WINDOW', 'POST_PIXEL')
+            # Passing self explicitly allows the draw callback to read 
+            # grid_data without primitive referencing errors.
+            self._draw_handler = bpy.types.SpaceImageEditor.draw_handler_add(
+                self.draw_callback_px, 
+                (self,), 
+                'WINDOW', 
+                'POST_PIXEL'
+            )
             
             context.window_manager.modal_handler_add(self)
             return {'RUNNING_MODAL'}
@@ -115,7 +144,6 @@ class ImageGalleryOverlay(bpy.types.Operator):
         viewport_width = context.region.width
         viewport_height = context.region.height
         
-        # Dynamically update columns on the fly
         self.columns = max(1, int(viewport_width // (self.cell_size + self.spacing)))
         
         active_image = self.edarea.spaces.active.image
@@ -124,20 +152,16 @@ class ImageGalleryOverlay(bpy.types.Operator):
         rows = math.ceil(len(imgs) / self.columns) if self.columns > 0 else 1
         total_height = rows * (self.cell_size + self.spacing)
         
-        # Center the view on the currently viewed image on initial launch / zoom
         if not ImageGalleryOverlay._initialized:
             active_row = active_idx // self.columns
-            # Math positions the row comfortably in the middle of the screen
             self.scroll_y = (viewport_height * 0.5) - (active_row * (self.cell_size + self.spacing)) - (self.cell_size / 2.0)
             ImageGalleryOverlay._initialized = True
 
-        # Clamp scrolling bounds natively
         if total_height > viewport_height:
             self.scroll_y = max(viewport_height - total_height, min(self.scroll_y, 0))
         else:
             self.scroll_y = 0
             
-        # Vectorize bounding box generation
         for i, image in enumerate(imgs):
             col = i % self.columns
             row = i // self.columns
@@ -149,16 +173,15 @@ class ImageGalleryOverlay(bpy.types.Operator):
             
         return grid_data
 
-    def draw_callback_px(self, cell_size, spacing, grid_data):
+    def draw_callback_px(self, op_instance):
         shader = gpu.shader.from_builtin('IMAGE')
         
         viewport_width = bpy.context.region.width
         viewport_height = bpy.context.region.height
         
-        for image_name, rect in grid_data.items():
+        for image_name, rect in op_instance.grid_data.items():
             x, y, w, h = rect
             
-            # Strict early exit to skip out-of-frame images completely
             if y + h < 0 or y > viewport_height or x + w < 0 or x > viewport_width:
                 continue
                 
@@ -166,12 +189,10 @@ class ImageGalleryOverlay(bpy.types.Operator):
             img_w, img_h = image.size
             
             if img_w > 0 and img_h > 0:
-                # Calculate largest fitting aspect ratio within the hardcoded square cell
                 ratio = min(w / img_w, h / img_h)
                 draw_w = img_w * ratio
                 draw_h = img_h * ratio
                 
-                # Center inside cell with offsets
                 offset_x = (w - draw_w) / 2.0
                 offset_y = (h - draw_h) / 2.0
                 
@@ -199,6 +220,8 @@ def register():
     bpy.types.IMAGE_MT_view.append(menu_func)
 
 def unregister():
+    if ImageGalleryOverlay.is_running():
+        ImageGalleryOverlay._instance.clean_up()
     bpy.utils.unregister_class(ImageGalleryOverlay)
     bpy.types.IMAGE_MT_view.remove(menu_func)
 
